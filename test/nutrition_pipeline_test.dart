@@ -542,12 +542,14 @@ void main() {
         expect(GeminiVisionService.activeModel, 'gemini-2.5-flash');
         expect(GeminiVisionService.defaultFallbackModels, [
           'gemini-2.5-flash',
-          'gemini-2.0-flash',
-          'gemini-1.5-flash',
+          'gemini-3-flash-preview',
+          'gemini-3.0-flash',
+          'gemini-2.5-pro',
+          'gemini-flash-latest',
         ]);
       });
 
-      test('Fallback loop: falls back from gemini-2.5-flash to gemini-2.0-flash on 503 and succeeds', () async {
+      test('Fallback loop: falls back from gemini-2.5-flash to gemini-flash-latest on 503 and succeeds', () async {
         final service = GeminiVisionService.instance;
         service.fallbackModels = List.from(GeminiVisionService.defaultFallbackModels);
         final attemptedModels = <String>[];
@@ -575,22 +577,63 @@ void main() {
           content: [Content.text('test')],
         );
 
-        expect(attemptedModels, ['gemini-2.5-flash', 'gemini-2.0-flash']);
+        expect(attemptedModels, ['gemini-2.5-flash', 'gemini-flash-latest']);
         expect(response.text, contains('Oatmeal with Blueberries'));
         service.mockGenerateContentWithModel = null;
       });
 
-      test('Fallback loop: when all fallback models fail with 503/404, throws clean user-friendly message', () async {
+      test('Auto-discovery: dynamically queries server and executes discovered model when primary models return 404', () async {
         final service = GeminiVisionService.instance;
         service.fallbackModels = List.from(GeminiVisionService.defaultFallbackModels);
+        final attemptedModels = <String>[];
+
+        // Mock auto-discovery returning 'gemini-2.0-flash'
+        service.mockDiscoverModel = (apiKey) async => 'gemini-2.0-flash';
+
+        service.mockGenerateContentWithModel = (modelName, content) async {
+          attemptedModels.add(modelName);
+          if (modelName == 'gemini-2.5-flash' || modelName == 'gemini-flash-latest') {
+            throw Exception('HTTP 404: Model Not Found');
+          }
+          return GenerateContentResponse(
+            [
+              Candidate(
+                Content.text('{"meal_name": "Discovered Model Salad", "items": []}'),
+                null,
+                null,
+                null,
+                null,
+              )
+            ],
+            null,
+          );
+        };
+
+        final response = await service.generateContentWithRetry(
+          content: [Content.text('test')],
+        );
+
+        expect(attemptedModels, [
+          'gemini-2.5-flash',
+          'gemini-flash-latest',
+          'gemini-2.0-flash',
+        ]);
+        expect(response.text, contains('Discovered Model Salad'));
+        service.mockGenerateContentWithModel = null;
+        service.mockDiscoverModel = null;
+      });
+
+      test('Fallback loop: when all models fail, includes primary model error in exception message', () async {
+        final service = GeminiVisionService.instance;
+        service.fallbackModels = ['gemini-2.5-flash', 'gemini-flash-latest'];
         final attemptedModels = <String>[];
 
         service.mockGenerateContentWithModel = (modelName, content) async {
           attemptedModels.add(modelName);
           if (modelName == 'gemini-2.5-flash') {
-            throw Exception('HTTP 404: Model Not Found');
+            throw Exception('HTTP 404: Primary Model Deprecated');
           }
-          throw Exception('HTTP 503: Model Overloaded');
+          throw Exception('HTTP 503: Fallback Model Overloaded');
         };
 
         try {
@@ -599,17 +642,14 @@ void main() {
           );
           fail('Should have thrown GeminiAnalysisException');
         } on GeminiAnalysisException catch (e) {
-          expect(
-            e.message,
-            'AI service is currently busy. Please try again in a moment.',
-          );
-          expect(attemptedModels, [
-            'gemini-2.5-flash',
-            'gemini-2.0-flash',
-            'gemini-1.5-flash',
-          ]);
+          // Verify both primary error and fallback error are preserved
+          expect(e.message, contains('Fallback Model Overloaded'));
+          expect(e.message, contains('Primary model error'));
+          expect(e.message, contains('Primary Model Deprecated'));
+          expect(attemptedModels, ['gemini-2.5-flash', 'gemini-flash-latest']);
         } finally {
           service.mockGenerateContentWithModel = null;
+          service.fallbackModels = List.from(GeminiVisionService.defaultFallbackModels);
         }
       });
 

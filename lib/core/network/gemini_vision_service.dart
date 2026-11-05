@@ -61,8 +61,10 @@ class GeminiVisionService {
   static const String activeModel = 'gemini-2.5-flash';
   static const List<String> defaultFallbackModels = [
     'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
+    'gemini-3-flash-preview',
+    'gemini-3.0-flash',
+    'gemini-2.5-pro',
+    'gemini-flash-latest',
   ];
 
   @visibleForTesting
@@ -132,6 +134,10 @@ class GeminiVisionService {
     Iterable<Content> content,
   )? mockGenerateContentWithModel;
 
+  /// Optional mock function for model auto-discovery testing.
+  @visibleForTesting
+  Future<String?> Function(String apiKey)? mockDiscoverModel;
+
   /// Configurable retry delays for transient errors (HTTP 503, 429).
   @visibleForTesting
   List<Duration> retryDelays = const [
@@ -140,13 +146,22 @@ class GeminiVisionService {
     Duration(milliseconds: 5000),
   ];
 
+  String _getApiKey() {
+    try {
+      if (dotenv.isInitialized) {
+        return dotenv.env['GEMINI_API_KEY'] ?? '';
+      }
+    } catch (_) {}
+    return '';
+  }
+
   GenerativeModel _getModelForName(String modelName) {
     if (_customModel != null) return _customModel!;
 
     final cached = _modelCache[modelName];
     if (cached != null) return cached;
 
-    final apiKey = dotenv.env['GEMINI_API_KEY'] ?? '';
+    final apiKey = _getApiKey();
     if (apiKey.isEmpty) {
       throw GeminiAnalysisException(
         'GEMINI_API_KEY is not set in .env. Please configure your Gemini API key.',
@@ -502,11 +517,77 @@ Rules:
     return 'Gemini API call failed: ${str.replaceFirst('GenerativeAIException: ', '').replaceFirst('Exception: ', '')}';
   }
 
-  /// Executes content generation across [fallbackModels] in order.
+  /// Discovers available Gemini models supporting `generateContent` directly from Google's API.
   ///
-  /// If [activeModel] ('gemini-2.5-flash') fails with a 503, 404, or error,
-  /// it immediately tries 'gemini-2.0-flash' and then 'gemini-1.5-flash'.
-  /// Throws [GeminiAnalysisException] if all fallback models fail or if a fatal error occurs.
+  /// Picks the first model containing 'flash' (or 'gemini'), stripping the 'models/' prefix.
+  @visibleForTesting
+  Future<String?> discoverAvailableFlashModel(String apiKey) => _discoverAvailableFlashModel(apiKey);
+
+  Future<String?> _discoverAvailableFlashModel(String apiKey) async {
+    if (mockDiscoverModel != null) {
+      return mockDiscoverModel!(apiKey);
+    }
+    if (apiKey.isEmpty) return null;
+
+    try {
+      final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey');
+      debugPrint('GeminiVisionService: Auto-discovering models via $uri...');
+      final response = await http.get(uri).timeout(const Duration(seconds: 10));
+      if (response.statusCode != 200) {
+        debugPrint(
+          'GeminiVisionService: Model discovery failed with status ${response.statusCode}: ${response.body}',
+        );
+        return null;
+      }
+
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic> || decoded['models'] is! List) {
+        debugPrint(
+          'GeminiVisionService: Unexpected model discovery response format: ${response.body}',
+        );
+        return null;
+      }
+
+      final modelsList = decoded['models'] as List;
+      final candidateNames = <String>[];
+      for (final item in modelsList) {
+        if (item is Map<String, dynamic>) {
+          final methods = item['supportedGenerationMethods'];
+          if (methods is List && methods.contains('generateContent')) {
+            final rawName = item['name']?.toString() ?? '';
+            final cleanName = rawName.startsWith('models/') ? rawName.substring(7) : rawName;
+            if (cleanName.isNotEmpty) {
+              candidateNames.add(cleanName);
+            }
+          }
+        }
+      }
+
+      debugPrint('GeminiVisionService: Discovered models from server: $candidateNames');
+
+      final flashModel = candidateNames.firstWhere(
+        (name) => name.toLowerCase().contains('flash'),
+        orElse: () => candidateNames.firstWhere(
+          (name) => name.toLowerCase().contains('gemini'),
+          orElse: () => candidateNames.isNotEmpty ? candidateNames.first : '',
+        ),
+      );
+
+      if (flashModel.isNotEmpty) {
+        debugPrint('GeminiVisionService: Selected auto-discovered model: "$flashModel"');
+        return flashModel;
+      }
+    } catch (e) {
+      debugPrint('GeminiVisionService: Auto-discovery failed with error: $e');
+    }
+    return null;
+  }
+
+  /// Executes content generation across fallback models, dynamically discovering
+  /// available models from Google if primary models return 404/503.
+  ///
+  /// Throws [GeminiAnalysisException] if all fallback models fail or if a fatal error occurs,
+  /// preserving the primary model error in the exception message.
   @visibleForTesting
   Future<GenerateContentResponse> generateContentWithRetry({
     GenerativeModel? model,
@@ -522,10 +603,34 @@ Rules:
   Future<GenerateContentResponse> _generateContentWithRetry({
     required List<Content> content,
   }) async {
+    Object? firstError;
     Object? lastError;
     StackTrace? lastStackTrace;
 
-    for (final modelName in fallbackModels) {
+    final apiKey = _getApiKey();
+
+    // Prioritize 'gemini-2.5-flash' and 'gemini-flash-latest' first
+    final modelsToTry = <String>[];
+    if (fallbackModels.contains('gemini-2.5-flash')) {
+      modelsToTry.add('gemini-2.5-flash');
+    }
+    if (fallbackModels.contains('gemini-flash-latest') &&
+        !modelsToTry.contains('gemini-flash-latest')) {
+      modelsToTry.add('gemini-flash-latest');
+    }
+    for (final m in fallbackModels) {
+      if (!modelsToTry.contains(m)) {
+        modelsToTry.add(m);
+      }
+    }
+    if (modelsToTry.isEmpty) {
+      modelsToTry.addAll(['gemini-2.5-flash', 'gemini-flash-latest']);
+    }
+
+    final triedModels = <String>{};
+    bool autoDiscoveryAttempted = false;
+
+    Future<GenerateContentResponse?> attemptModel(String modelName) async {
       debugPrint(
         'GeminiVisionService: Attempting model "$modelName" with ${modelTimeout.inSeconds}s timeout...',
       );
@@ -550,6 +655,7 @@ Rules:
         );
         return response;
       } catch (e, st) {
+        firstError ??= e;
         lastError = e;
         lastStackTrace = st;
 
@@ -569,23 +675,61 @@ Rules:
         }
 
         debugPrint(
-          'GeminiVisionService: Model "$modelName" failed with error: $e. Immediately trying next fallback model...',
+          'GeminiVisionService: Model "$modelName" failed with error: $e.',
         );
+        return null;
       }
     }
 
-    // All retries failed
-    final reason = _extractErrorCodeOrReason(lastError ?? '503');
+    for (int i = 0; i < modelsToTry.length; i++) {
+      final modelName = modelsToTry[i];
+      if (triedModels.contains(modelName)) continue;
+      triedModels.add(modelName);
+
+      final response = await attemptModel(modelName);
+      if (response != null) return response;
+
+      final reason = _extractErrorCodeOrReason(lastError ?? '');
+      final is404Or503 = reason == '404' || reason == '503';
+
+      final triedPrimaryFlash = triedModels.contains('gemini-2.5-flash') &&
+          (triedModels.contains('gemini-flash-latest') ||
+              !modelsToTry.contains('gemini-flash-latest'));
+
+      if (!autoDiscoveryAttempted && is404Or503 && triedPrimaryFlash) {
+        autoDiscoveryAttempted = true;
+        debugPrint(
+          'GeminiVisionService: Primary models failed with $reason. Discovering valid active model ID from Google...',
+        );
+        final discoveredModel = await _discoverAvailableFlashModel(apiKey);
+        if (discoveredModel != null && !triedModels.contains(discoveredModel)) {
+          debugPrint(
+            'GeminiVisionService: Running generateContent with auto-discovered model "$discoveredModel"...',
+          );
+          triedModels.add(discoveredModel);
+          final discResponse = await attemptModel(discoveredModel);
+          if (discResponse != null) return discResponse;
+        }
+      }
+    }
+
+    // All retries and fallbacks failed
+    final primaryErrorMsg =
+        _sanitizeErrorMessage(firstError ?? 'Unknown Gemini error');
+    final lastErrorMsg =
+        _sanitizeErrorMessage(lastError ?? 'Unknown Gemini error');
+    final combinedMsg = (firstError != null && firstError != lastError)
+        ? '$lastErrorMsg (Primary model error: $primaryErrorMsg)'
+        : primaryErrorMsg;
+
     debugPrint(
-      'GeminiVisionService: All fallback models failed (last reason: $reason). Last error: $lastError',
+      'GeminiVisionService: All fallback models failed. Throwing: $combinedMsg',
     );
     if (lastStackTrace != null) {
       debugPrint('GeminiVisionService: Full stack trace for last error:\n$lastStackTrace');
     }
 
-    throw GeminiAnalysisException(
-      'AI service is currently busy. Please try again in a moment.',
-    );
+    throw GeminiAnalysisException(combinedMsg);
   }
 }
 
